@@ -1,7 +1,3 @@
-Okay, here is the README content formatted as raw markdown text. You should be able to copy and paste this directly into your `README.md` file.
-
----
-
 # Ansible Playbook for Minimal k3s Cluster Setup (for Flux/Cilium)
 
 This Ansible playbook automates the process of setting up a fresh, minimal Kubernetes cluster using k3s. It is specifically designed to prepare nodes for a GitOps workflow managed by Flux, where Flux itself will be responsible for installing the CNI (Container Network Interface), such as Cilium.
