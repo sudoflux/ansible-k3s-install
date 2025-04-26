@@ -119,12 +119,4 @@ flux bootstrap github \
 
 Ensure your GitOps repository (at the specified `--path`) contains the Kubernetes manifests for Flux to install your desired CNI (e.g., Cilium). Once Flux applies the CNI manifests, the nodes should transition to the `Ready` state.
 
-## Contributing
-
-Contributions are welcome! Please feel free to open an issue or submit a pull request.
-
-## License
-
-[Specify your license here, e.g., MIT License]
-
 ---
