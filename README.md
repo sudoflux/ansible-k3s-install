@@ -77,6 +77,18 @@ Run the playbook from your control machine, pointing it to your inventory file:
 
 *(Replace `inventory.yaml` and `rebuild_k3s_flux.yaml` with your actual file names if different.)*
 
+Example:
+
+```
+ansible-playbook -i hosts rebuild_k3s_flux.yaml --ask-become-pass
+```
+
+With debugging:
+
+```
+ansible-playbook -i hosts rebuild_k3s_flux.yaml --ask-become-pass -vvvv
+```
+
 The playbook will execute the wipe, reboot, install, and setup steps across all defined nodes.
 
 ## Expected Outcome
