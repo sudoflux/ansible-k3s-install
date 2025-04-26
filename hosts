@@ -7,4 +7,4 @@ k3s2
 k3s3
 
 [all:vars]
-ansible_user={{ ansible_user | default('root') }}
+ansible_user=josh

@@ -1,0 +1,31 @@
+---
+- name: Wipe, reboot, and uninstall k3s and flux via local script
+  hosts: all
+  become: yes
+  max_fail_percentage: 100
+  vars:
+    k3s_install_script: |
+      #!/bin/bash
+      set -e
+      # Uninstall k3s/k3s-agent if present
+      [ -f /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true
+      [ -f /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true
+      rm -rf /etc/rancher/k3s /var/lib/rancher/k3s /var/lib/kubelet ~/.kube ~/.flux
+      # Remove flux if kubectl exists
+      if [ -f /usr/local/bin/kubectl ]; then
+        /usr/local/bin/kubectl delete namespace flux-system --ignore-not-found || true
+      fi
+      # Reboot to restore networking after uninstall completes
+      reboot
+  tasks:
+    - name: Copy k3s wipe/reinstall script to node
+      copy:
+        content: "{{ k3s_install_script }}"
+        dest: /tmp/k3s_wipe_reinstall.sh
+        mode: '0755'
+
+    - name: Run k3s wipe/reinstall script in foreground (triggers reboot)
+      shell: /tmp/k3s_wipe_reinstall.sh
+      async: 0
+      poll: 0
+      ignore_errors: yes

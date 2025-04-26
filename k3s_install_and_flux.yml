@@ -1,0 +1,130 @@
+---
+- name: Wait for node to reboot and come back online
+  hosts: all
+  become: yes
+  tasks:
+    - name: Wait for node to reboot and come back online
+      wait_for_connection:
+        timeout: 180
+      ignore_unreachable: yes
+
+- name: Clear host errors after reboot
+  hosts: all
+  tasks:
+    - meta: clear_host_errors
+
+- name: Install latest k3s on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Install latest k3s (server, minimal for Cilium)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | sh -s - --disable-network-policy --flannel-backend=none --disable=traefik
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for k3s node-token file to exist
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+        state: present
+        timeout: 120
+
+    - name: Get k3s token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Set fact for k3s token
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_token['content'] | b64decode | trim }}"
+
+    - name: Set master IP fact
+      ansible.builtin.set_fact:
+        k3s_master_ip: "{{ ansible_host | default(inventory_hostname) }}"
+
+    - name: Wait for Kubernetes API to be available after k3s install
+      ansible.builtin.shell: |
+        for i in {1..24}; do
+          kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml get nodes && exit 0
+          sleep 5
+        done
+        exit 1
+      register: k3s_api_ready
+      changed_when: false
+      failed_when: k3s_api_ready.rc != 0
+
+- name: Install latest k3s on workers
+  hosts: workers
+  become: yes
+  vars:
+    k3s_master_ip: "{{ hostvars['k3s-master1']['k3s_master_ip'] }}"
+    k3s_node_token: "{{ hostvars['k3s-master1']['k3s_node_token'] }}"
+  tasks:
+    - name: Install latest k3s (agent, minimal for Cilium)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | K3S_URL="https://{{ k3s_master_ip }}:6443" K3S_TOKEN="{{ k3s_node_token }}" sh -s -
+      args:
+        creates: /usr/local/bin/k3s-agent
+
+    - name: Wait for Kubernetes API to be available after worker join
+      ansible.builtin.shell: |
+        for i in {1..24}; do
+          kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml get nodes | grep -q Ready && exit 0
+          sleep 5
+        done
+        exit 1
+      register: workers_api_ready
+      changed_when: false
+      failed_when: workers_api_ready.rc != 0
+
+- name: Install flux on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Download flux CLI
+      ansible.builtin.shell: |
+        curl -s https://fluxcd.io/install.sh | bash
+      args:
+        creates: /usr/local/bin/flux
+
+    - name: Install flux components
+      ansible.builtin.shell: |
+        flux install
+      become: true
+      become_user: root
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /var/lib/rancher/k3s/server/manifests/flux-system.yaml
+
+    - name: Ensure .kube directory exists
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+      become: true
+      become_user: root
+
+    - name: Copy kubeconfig to user's home directory
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      become: true
+      become_user: root
+
+    - name: Ensure KUBECONFIG is set in .bashrc
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        line: 'export KUBECONFIG=/home/{{ ansible_user }}/.kube/config'
+        state: present
+        insertafter: EOF
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      become: true
+      become_user: root
