@@ -1,0 +1,303 @@
+---
+# ==================================================================
+# Play 1: Wipe k3s, Flux, Schedule Reboot, and Wait
+# Target: All nodes
+# Goal: Clean slate, trigger reboot via OS scheduler, wait for reboot
+# ==================================================================
+- name: Phase 1 - Wipe k3s, Flux, and Reboot Nodes
+  hosts: all
+  become: yes
+  gather_facts: no
+  # Ensure ALL nodes are wiped/rebooted successfully before proceeding
+  max_fail_percentage: 0
+  vars:
+    # --- Wipe Script --- (Same Robust Script as Before)
+    k3s_flux_wipe_script: |
+      #!/bin/bash
+      set -e # Exit on error unless handled
+      echo "Starting k3s and Flux wipe process..."
+
+      # --- Pre-checks ---
+      if ! command -v shutdown &> /dev/null; then
+        echo "ERROR: 'shutdown' command not found. Cannot schedule reboot." >&2
+        exit 1
+      fi
+      KUBECTL_PATH="/usr/local/bin/kubectl"
+      FLUX_NS="flux-system"
+      KUBECTL_TIMEOUT="45s"
+
+      # --- Flux Removal (Robust) ---
+      echo "Checking for kubectl at ${KUBECTL_PATH}..."
+      if [ -f "${KUBECTL_PATH}" ]; then
+        echo "kubectl found. Attempting Flux cleanup for namespace ${FLUX_NS}..."
+        echo "Attempting initial delete of ${FLUX_NS} namespace (timeout: ${KUBECTL_TIMEOUT})..."
+        if "${KUBECTL_PATH}" delete namespace "${FLUX_NS}" --ignore-not-found=true --timeout="${KUBECTL_TIMEOUT}"; then
+            echo "Initial delete command succeeded or namespace was not found."
+        else
+            echo "WARN: Initial delete command failed or timed out. Proceeding..."
+        fi
+
+        echo "Checking if ${FLUX_NS} namespace is stuck in Terminating state (timeout: ${KUBECTL_TIMEOUT})..."
+        terminating_status=$( ("${KUBECTL_PATH}" get namespace "${FLUX_NS}" --ignore-not-found=true --timeout="${KUBECTL_TIMEOUT}" -o jsonpath='{.status.phase}' 2>/dev/null) || echo "ErrorCheckingStatus" )
+
+        if [[ "$terminating_status" == "Terminating" ]]; then
+            echo "${FLUX_NS} namespace is Terminating. Attempting to remove finalizers..."
+            if command -v /usr/bin/jq > /dev/null 2>&1; then
+                echo "jq found. Attempting finalizer removal via patch (timeout: ${KUBECTL_TIMEOUT})..."
+                ( \
+                  "${KUBECTL_PATH}" get namespace "${FLUX_NS}" --timeout="${KUBECTL_TIMEOUT}" -o json | \
+                  /usr/bin/jq 'del(.spec.finalizers)' | \
+                  "${KUBECTL_PATH}" replace --raw "/api/v1/namespaces/${FLUX_NS}/finalize" --timeout="${KUBECTL_TIMEOUT}" -f - \
+                ) || echo "WARN: Finalizer removal command sequence failed or timed out."
+            else
+                echo "WARN: jq command not found. Cannot automatically remove finalizers for stuck namespace ${FLUX_NS}."
+            fi
+        elif [[ "$terminating_status" == "ErrorCheckingStatus" ]]; then
+            echo "WARN: Could not reliably determine the status of ${FLUX_NS} namespace."
+        else
+            echo "${FLUX_NS} namespace is not in Terminating state (or was successfully deleted/not found)."
+        fi
+      else
+        echo "kubectl not found at ${KUBECTL_PATH}, skipping Flux namespace deletion."
+      fi
+
+      echo "Removing ~/.flux directory and flux binary (if they exist)..."
+      rm -rf ~/.flux
+      rm -f /usr/local/bin/flux
+
+      # --- Schedule Reboot (Critical Step - Before Disruptive Uninstall) ---
+      echo "Scheduling system reboot in 1 minute..."
+      wall "System is scheduling an automatic reboot in 1 minute for k3s cleanup."
+      shutdown -r +1 "Scheduled reboot after k3s/CNI wipe attempt" &
+      sleep 3
+
+      # --- k3s Uninstall (Disruptive) ---
+      echo "Checking for and running k3s uninstall scripts (network may drop now)..."
+      if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+        echo "Running k3s-uninstall.sh..."
+        /usr/local/bin/k3s-uninstall.sh || echo "WARN: k3s-uninstall.sh exited with non-zero status."
+      fi
+      if [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then
+        echo "Running k3s-agent-uninstall.sh..."
+        /usr/local/bin/k3s-agent-uninstall.sh || echo "WARN: k3s-agent-uninstall.sh exited with non-zero status."
+      fi
+
+      # --- Final Filesystem Cleanup ---
+      echo "Performing final filesystem cleanup..."
+      rm -rf /etc/rancher/ /var/lib/rancher/ /var/lib/kubelet /run/k3s /run/flannel* /var/log/pods /var/log/containers /etc/cni/ /opt/cni/ /var/lib/cni/
+
+      echo "Wipe script finished execution. Reboot has been scheduled."
+  tasks:
+    - name: Ensure jq is installed (for Flux finalizer removal)
+      ansible.builtin.package:
+        name: jq
+        state: present
+      ignore_errors: yes
+
+    - name: Create temporary script directory
+      ansible.builtin.file:
+        path: /tmp/ansible_wipe_scripts
+        state: directory
+        mode: '0700'
+
+    - name: Copy k3s/Flux wipe script to node
+      ansible.builtin.copy:
+        content: "{{ k3s_flux_wipe_script }}"
+        dest: /tmp/ansible_wipe_scripts/k3s_flux_wipe.sh
+        mode: '0755'
+
+    - name: Run k3s/Flux wipe script (schedules reboot, network may drop)
+      ansible.builtin.command: /tmp/ansible_wipe_scripts/k3s_flux_wipe.sh
+      register: wipe_script_output
+      changed_when: true
+      ignore_errors: yes # ESSENTIAL
+
+    - name: Display wipe script output (might be incomplete)
+      ansible.builtin.debug:
+        var: wipe_script_output.stdout_lines
+      when: wipe_script_output.stdout_lines is defined
+
+    - name: Wait for scheduled reboot and node to come back online
+      ansible.builtin.reboot:
+        msg: "Waiting for node reboot after k3s/CNI wipe and SSH access"
+        connect_timeout: 10
+        pre_reboot_delay: 75
+        reboot_timeout: 900
+        post_reboot_delay: 30
+        test_command: whoami
+
+    - name: Remove temporary script directory
+      ansible.builtin.file:
+        path: /tmp/ansible_wipe_scripts
+        state: absent
+      ignore_errors: yes
+
+# ==================================================================
+# Play 2: Wait for Connection and Clear Errors
+# Target: All nodes
+# Goal: Ensure connectivity post-reboot and reset Ansible's error state
+# ==================================================================
+- name: Phase 2 - Verify Connection and Clear Host Errors
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Wait for SSH connection after reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+        delay: 10
+
+    - name: Clear host errors
+      ansible.builtin.meta: clear_host_errors
+
+# ==================================================================
+# Play 3: Install MINIMAL k3s on Master Node (NO CNI)
+# Target: master group
+# Goal: Install k3s server without Flannel/CNI, Traefik, ServiceLB
+# ==================================================================
+- name: Phase 3 - Install Minimal k3s on Master (No CNI)
+  hosts: master
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Install latest k3s (server, NO CNI, minimal)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+          --disable-network-policy \
+          --flannel-backend=none \
+          --disable=traefik \
+          --disable=servicelb \
+          --write-kubeconfig-mode '0644'" \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s # Idempotency
+
+    - name: Wait for k3s node-token file
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/server/node-token
+        state: present
+        timeout: 180
+
+    - name: Get k3s token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Set fact for k3s token
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_token['content'] | b64decode | trim }}"
+        cacheable: yes
+
+    - name: Set master IP fact
+      ansible.builtin.set_fact:
+        k3s_master_ip: "{{ ansible_host | default(inventory_hostname) }}"
+        cacheable: yes
+
+    - name: Wait up to 2 minutes for Kubernetes API SERVER to be available
+      # Check API server directly, NOT node status
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml version
+      register: k3s_api_check
+      until: k3s_api_check.rc == 0
+      retries: 24
+      delay: 5
+      changed_when: false
+      failed_when: k3s_api_check.rc != 0
+      # Ignore stderr about connection refused during wait
+      ignore_errors: yes
+      # Final check after loop
+    - name: Final check API server available
+      ansible.builtin.command:
+         cmd: kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml version
+      changed_when: false
+
+
+# ==================================================================
+# Play 4: Install k3s AGENT on Worker Nodes (NO CNI)
+# Target: workers group
+# Goal: Join workers to master. Workers will remain NotReady.
+# ==================================================================
+- name: Phase 4 - Install k3s Agent on Workers (Will be NotReady)
+  hosts: workers
+  become: yes
+  gather_facts: no
+  # *** IMPORTANT: Ensure 'k3s-master1' matches your master's inventory hostname ***
+  vars:
+    k3s_master_hostname: "k3s-master1" # <-- CHANGE THIS if needed!
+    k3s_master_ip: "{{ hostvars[k3s_master_hostname]['k3s_master_ip'] }}"
+    k3s_node_token: "{{ hostvars[k3s_master_hostname]['k3s_node_token'] }}"
+  tasks:
+    - name: Check if master IP and token are available
+      ansible.builtin.fail:
+        msg: "Master IP or Token not found from host '{{ k3s_master_hostname }}'. Check hostname and Play 3 completion."
+      when: k3s_master_ip is not defined or k3s_node_token is not defined
+
+    - name: Install latest k3s (agent, joining master)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | K3S_URL="https://{{ k3s_master_ip }}:6443" K3S_TOKEN="{{ k3s_node_token }}" sh -s - agent
+      args:
+        creates: /usr/local/bin/k3s-agent # Idempotency
+
+    - name: Informational message about worker status
+      ansible.builtin.debug:
+        msg: "Worker agent installed. Node will remain in 'NotReady' state until a CNI (like Cilium) is installed via Flux."
+
+# ==================================================================
+# Play 5: Install Flux CLI and Configure Kubeconfig (NO Flux Components)
+# Target: master group
+# Goal: Install Flux CLI tool, configure user kubeconfig. Ready for bootstrap.
+# ==================================================================
+- name: Phase 5 - Install Flux CLI and Setup Kubeconfig
+  hosts: master
+  become: yes # Default become for tasks in this play
+  gather_facts: no
+  vars:
+    target_user: "{{ ansible_user }}"
+    target_user_home: "/home/{{ ansible_user }}" # Adjust if needed
+  tasks:
+    - name: Download and install Flux CLI using official script
+      ansible.builtin.shell:
+        cmd: curl -s https://fluxcd.io/install.sh | bash
+      args:
+        # This makes the task idempotent: it only runs if /usr/local/bin/flux does NOT exist.
+        creates: /usr/local/bin/flux
+      # Ensure script runs with root privileges to install to /usr/local/bin
+      become: yes
+
+    - name: Ensure .kube directory exists for target user
+      ansible.builtin.file:
+        path: "{{ target_user_home }}/.kube"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}" # Adjust group if needed
+        mode: '0700'
+
+    - name: Copy k3s kubeconfig to user's home directory
+      ansible.builtin.copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ target_user_home }}/.kube/config"
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}" # Adjust group if needed
+        mode: '0600'
+        remote_src: yes
+
+    - name: Ensure KUBECONFIG is set in .bashrc (optional convenience)
+      ansible.builtin.lineinfile:
+        path: "{{ target_user_home }}/.bashrc"
+        regexp: '^export KUBECONFIG='
+        line: 'export KUBECONFIG={{ target_user_home }}/.kube/config'
+        state: present
+        insertafter: EOF
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}" # Adjust group if needed
+        mode: '0644'
+        create: yes
+
+    - name: Final Instructions
+      ansible.builtin.debug:
+        msg:
+          - "k3s cluster installed minimally (no CNI, no Traefik, no ServiceLB)."
+          - "Worker nodes have joined but are expected to be in 'NotReady' state."
+          - "Flux CLI installed at /usr/local/bin/flux on the master node."
+          - "Kubeconfig copied to {{ target_user_home }}/.kube/config on the master node."
+          - "The cluster is now ready for you to bootstrap Flux."
+          - "Flux will be responsible for deploying the CNI (e.g., Cilium)."
