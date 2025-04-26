@@ -1,0 +1,88 @@
+---
+- name: Wipe and reinstall k3s and flux
+  hosts: all
+  become: yes
+  tasks:
+    - name: Stop k3s service
+      ansible.builtin.systemd:
+        name: k3s
+        state: stopped
+      ignore_errors: yes
+
+    - name: Stop k3s-agent service
+      ansible.builtin.systemd:
+        name: k3s-agent
+        state: stopped
+      ignore_errors: yes
+
+    - name: Remove k3s and data
+      ansible.builtin.shell: |
+        /usr/local/bin/k3s-uninstall.sh || true
+        /usr/local/bin/k3s-agent-uninstall.sh || true
+        rm -rf /etc/rancher/k3s /var/lib/rancher/k3s /var/lib/kubelet ~/.kube
+      args:
+        warn: false
+      ignore_errors: yes
+
+    - name: Remove flux components (if any)
+      ansible.builtin.shell: |
+        kubectl delete namespace flux-system --ignore-not-found
+        rm -rf ~/.flux
+      args:
+        warn: false
+      ignore_errors: yes
+
+- name: Install latest k3s on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Install latest k3s (server, minimal for Cilium)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | sh -s - --disable-network-policy --flannel-backend=none --disable=traefik
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Get k3s token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Set fact for k3s token
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_token['content'] | b64decode | trim }}"
+
+    - name: Set master IP fact
+      ansible.builtin.set_fact:
+        k3s_master_ip: "{{ ansible_host | default(inventory_hostname) }}"
+
+- name: Install latest k3s on workers
+  hosts: workers
+  become: yes
+  vars:
+    k3s_master_ip: "{{ hostvars['k3s-master1']['k3s_master_ip'] }}"
+    k3s_node_token: "{{ hostvars['k3s-master1']['k3s_node_token'] }}"
+  tasks:
+    - name: Install latest k3s (agent, minimal for Cilium)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | K3S_URL="https://{{ k3s_master_ip }}:6443" K3S_TOKEN="{{ k3s_node_token }}" sh -s - --disable-network-policy --flannel-backend=none --disable=traefik
+      args:
+        creates: /usr/local/bin/k3s-agent
+
+- name: Install flux on master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Download flux CLI
+      ansible.builtin.shell: |
+        curl -s https://fluxcd.io/install.sh | bash
+      args:
+        creates: /usr/local/bin/flux
+
+    - name: Install flux components
+      ansible.builtin.shell: |
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        flux install
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      args:
+        creates: /var/lib/rancher/k3s/server/manifests/flux-system.yaml
