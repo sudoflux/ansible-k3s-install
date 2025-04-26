@@ -1,31 +1,154 @@
----
-- name: Wipe, reboot, and uninstall k3s and flux via local script
+- name: Wipe k3s, Flux, and Reboot Nodes
   hosts: all
   become: yes
+  gather_facts: no
   max_fail_percentage: 100
   vars:
-    k3s_install_script: |
+    # Increased robustness in the Flux removal section
+    k3s_flux_wipe_script: |
       #!/bin/bash
+      # Exit immediately if a command exits with a non-zero status,
+      # unless explicitly handled with || true or || echo ...
       set -e
-      # Uninstall k3s/k3s-agent if present
-      [ -f /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh || true
-      [ -f /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh || true
-      rm -rf /etc/rancher/k3s /var/lib/rancher/k3s /var/lib/kubelet ~/.kube ~/.flux
-      # Remove flux if kubectl exists
-      if [ -f /usr/local/bin/kubectl ]; then
-        /usr/local/bin/kubectl delete namespace flux-system --ignore-not-found || true
+      echo "Starting k3s and Flux wipe process..."
+
+      # --- Pre-checks ---
+      if ! command -v shutdown &> /dev/null; then
+        echo "ERROR: 'shutdown' command not found. Cannot schedule reboot." >&2
+        exit 1
       fi
-      # Reboot to restore networking after uninstall completes
-      reboot
+      KUBECTL_PATH="/usr/local/bin/kubectl" # Define path for clarity
+      FLUX_NS="flux-system"
+      KUBECTL_TIMEOUT="45s" # Set a timeout for kubectl operations
+
+      # --- Flux Removal (More Robust) ---
+      echo "Checking for kubectl at ${KUBECTL_PATH}..."
+      if [ -f "${KUBECTL_PATH}" ]; then
+        echo "kubectl found. Attempting Flux cleanup for namespace ${FLUX_NS}..."
+
+        # 1. Attempt initial namespace deletion (Best Effort)
+        echo "Attempting initial delete of ${FLUX_NS} namespace (timeout: ${KUBECTL_TIMEOUT})..."
+        # Run the command, but continue even if it fails or times out.
+        if "${KUBECTL_PATH}" delete namespace "${FLUX_NS}" --ignore-not-found=true --timeout="${KUBECTL_TIMEOUT}"; then
+            echo "Initial '${KUBECTL_PATH} delete namespace ${FLUX_NS}' command succeeded or namespace was not found."
+        else
+            # This means the command failed OR timed out. Log it, but continue.
+            echo "WARN: Initial '${KUBECTL_PATH} delete namespace ${FLUX_NS}' failed or timed out. Proceeding with cleanup..."
+        fi
+        # Script *always* continues past this point.
+
+        # 2. Check if namespace is stuck in Terminating state (Best Effort)
+        echo "Checking if ${FLUX_NS} namespace is stuck in Terminating state (timeout: ${KUBECTL_TIMEOUT})..."
+        # Use a subshell and || true to handle potential errors/timeouts in 'kubectl get' without stopping the script
+        terminating_status=$( ("${KUBECTL_PATH}" get namespace "${FLUX_NS}" --ignore-not-found=true --timeout="${KUBECTL_TIMEOUT}" -o jsonpath='{.status.phase}' 2>/dev/null) || echo "ErrorCheckingStatus" )
+
+        if [[ "$terminating_status" == "Terminating" ]]; then
+            echo "${FLUX_NS} namespace is Terminating. Attempting to remove finalizers..."
+            # 3. Attempt finalizer removal ONLY if Terminating (Best Effort)
+            if command -v /usr/bin/jq > /dev/null 2>&1; then
+                echo "jq found. Attempting finalizer removal via patch (timeout: ${KUBECTL_TIMEOUT})..."
+                # Run this sequence also with error/timeout tolerance using || true in a subshell
+                ( \
+                  "${KUBECTL_PATH}" get namespace "${FLUX_NS}" --timeout="${KUBECTL_TIMEOUT}" -o json | \
+                  /usr/bin/jq 'del(.spec.finalizers)' | \
+                  "${KUBECTL_PATH}" replace --raw "/api/v1/namespaces/${FLUX_NS}/finalize" --timeout="${KUBECTL_TIMEOUT}" -f - \
+                ) || echo "WARN: Finalizer removal command sequence failed or timed out (kubectl get, jq, or kubectl replace)."
+                # Script continues even if finalizer removal fails/times out.
+            else
+                echo "WARN: jq command not found. Cannot automatically remove finalizers for stuck namespace ${FLUX_NS}."
+            fi
+        elif [[ "$terminating_status" == "ErrorCheckingStatus" ]]; then
+            echo "WARN: Could not reliably determine the status of ${FLUX_NS} namespace (kubectl get failed, timed out, or namespace gone)."
+        else
+            echo "${FLUX_NS} namespace is not in Terminating state (or was successfully deleted/not found)."
+        fi
+      else
+        echo "kubectl not found at ${KUBECTL_PATH}, skipping Flux namespace deletion."
+      fi # End of kubectl check
+
+      # --- General Flux/k3s File Cleanup (Always Run) ---
+      echo "Removing ~/.flux directory and flux binary (if they exist)..."
+      rm -rf ~/.flux
+      rm -f /usr/local/bin/flux # Remove flux CLI if present
+
+      # --- Schedule Reboot (Critical Step) ---
+      echo "Scheduling system reboot in 1 minute..."
+      wall "System is scheduling an automatic reboot in 1 minute for k3s cleanup."
+      # Ensure this runs!
+      shutdown -r +1 "Scheduled reboot after k3s/CNI wipe attempt" &
+      sleep 3 # Brief pause
+
+      # --- k3s Uninstall (Potentially Disruptive, Run After Scheduling Reboot) ---
+      echo "Checking for and running k3s uninstall scripts (network may drop now)..."
+      if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+        echo "Running k3s-uninstall.sh..."
+        # Allow script to continue even if uninstall fails partially
+        /usr/local/bin/k3s-uninstall.sh || echo "WARN: k3s-uninstall.sh exited with non-zero status."
+      else
+        echo "k3s-uninstall.sh not found."
+      fi
+
+      if [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then
+        echo "Running k3s-agent-uninstall.sh..."
+        /usr/local/bin/k3s-agent-uninstall.sh || echo "WARN: k3s-agent-uninstall.sh exited with non-zero status."
+      else
+        echo "k3s-agent-uninstall.sh not found."
+      fi
+
+      # --- Final Filesystem Cleanup (Run After Uninstall Attempts) ---
+      echo "Performing final filesystem cleanup..."
+      rm -rf /etc/rancher/ /var/lib/rancher/ /var/lib/kubelet /run/k3s /run/flannel* /var/log/pods /var/log/containers /etc/cni/ /opt/cni/ /var/lib/cni/
+      # rm -rf ~/.kube # Be cautious with user's kube config
+
+      echo "Wipe script finished execution. Reboot has been scheduled."
+      # OS takes over rebooting based on the scheduled 'shutdown' command.
+
   tasks:
-    - name: Copy k3s wipe/reinstall script to node
+    # (jq installation task remains the same)
+    - name: Ensure jq is installed (for Flux finalizer removal)
+      package:
+        name: jq
+        state: present
+      ignore_errors: yes
+
+    # (Script copy task remains the same, maybe use a temp dir)
+    - name: Create temporary script directory
+      file:
+        path: /tmp/ansible_wipe_scripts
+        state: directory
+        mode: '0700'
+
+    - name: Copy k3s/Flux wipe script to node
       copy:
-        content: "{{ k3s_install_script }}"
-        dest: /tmp/k3s_wipe_reinstall.sh
+        content: "{{ k3s_flux_wipe_script }}"
+        dest: /tmp/ansible_wipe_scripts/k3s_flux_wipe.sh
         mode: '0755'
 
-    - name: Run k3s wipe/reinstall script in foreground (triggers reboot)
-      shell: /tmp/k3s_wipe_reinstall.sh
-      async: 0
-      poll: 0
+    # (Script execution task remains the same - needs ignore_errors: yes)
+    - name: Run k3s/Flux wipe script (schedules reboot, network may drop)
+      command: /tmp/ansible_wipe_scripts/k3s_flux_wipe.sh
+      register: wipe_script_output
+      changed_when: true
+      ignore_errors: yes # ESSENTIAL - expect connection loss
+
+    - name: Display wipe script output (might be incomplete)
+      debug:
+        var: wipe_script_output.stdout_lines
+      when: wipe_script_output.stdout_lines is defined
+
+    # (Wait for reboot task remains the same)
+    - name: Wait for scheduled reboot to start and node to come back online
+      reboot:
+        msg: "Waiting for node to reboot after k3s/CNI wipe and come back online"
+        connect_timeout: 10
+        pre_reboot_delay: 75 # > 1 minute schedule time
+        reboot_timeout: 900 # 15 minutes total wait
+        post_reboot_delay: 30
+        test_command: whoami
+
+    # (Cleanup task remains the same)
+    - name: Remove the temporary script directory after successful reboot
+      file:
+        path: /tmp/ansible_wipe_scripts
+        state: absent
       ignore_errors: yes

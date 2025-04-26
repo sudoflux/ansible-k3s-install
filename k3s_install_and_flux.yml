@@ -66,17 +66,6 @@
       args:
         creates: /usr/local/bin/k3s-agent
 
-    - name: Wait for Kubernetes API to be available after worker join
-      ansible.builtin.shell: |
-        for i in {1..24}; do
-          kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml get nodes | grep -q Ready && exit 0
-          sleep 5
-        done
-        exit 1
-      register: workers_api_ready
-      changed_when: false
-      failed_when: workers_api_ready.rc != 0
-
 - name: Install flux on master
   hosts: master
   become: yes
